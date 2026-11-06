@@ -14,7 +14,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    DataCollatorForLanguageModeling,
+    DataCollatorForSeq2Seq,
     Trainer,
     TrainingArguments,
 )
@@ -22,7 +22,6 @@ from transformers import (
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = ROOT / "data" / "housing_prices.jsonl"
 OUT_DIR = ROOT / "outputs" / "housing-lora"
-# 优先用本地模型（见 download_model.sh）；也可设环境变量 MODEL_ID
 _LOCAL = ROOT / "models" / "Qwen2.5-0.5B-Instruct"
 MODEL_ID = os.environ.get(
     "MODEL_ID",
@@ -30,14 +29,15 @@ MODEL_ID = os.environ.get(
 )
 
 # Intel Mac：无 MPS/CUDA，强制 CPU + fp32
+# 样本很少时提高 epoch，故意在训练集上过拟合，便于看到 LoRA 效果
 DEVICE = "cpu"
 MAX_LEN = 384
-EPOCHS = 3
-LR = 1e-4
+EPOCHS = 12
+LR = 2e-4
 BATCH = 1
 GRAD_ACCUM = 4
-LORA_R = 8
-LORA_ALPHA = 16
+LORA_R = 16
+LORA_ALPHA = 32
 
 
 def load_messages(path: Path) -> list[dict]:
@@ -65,41 +65,52 @@ def main() -> None:
         low_cpu_mem_usage=True,
     )
     model.to(DEVICE)
+    # 关闭 cache，训练更稳
+    model.config.use_cache = False
 
     lora = LoraConfig(
         r=LORA_R,
         lora_alpha=LORA_ALPHA,
-        lora_dropout=0.05,
+        lora_dropout=0.0,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
-        target_modules=["q_proj", "v_proj"],  # 少挂几层，CPU 更轻
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     )
     model = get_peft_model(model, lora)
     model.print_trainable_parameters()
 
     raw = load_messages(DATA_PATH)
 
-    def to_text(example: dict) -> dict:
-        text = tokenizer.apply_chat_template(
-            example["messages"],
+    def tokenize_row(example: dict) -> dict:
+        messages = example["messages"]
+        # 完整对话（含 assistant 答案）
+        full_text = tokenizer.apply_chat_template(
+            messages,
             tokenize=False,
             add_generation_prompt=False,
         )
-        return {"text": text}
-
-    ds = Dataset.from_list(raw).map(to_text)
-
-    def tokenize(batch: dict) -> dict:
-        out = tokenizer(
-            batch["text"],
-            truncation=True,
-            max_length=MAX_LEN,
-            padding=False,
+        # 仅到 user，用于把 prompt 段 labels 置为 -100（只学回答）
+        prompt_text = tokenizer.apply_chat_template(
+            messages[:-1],
+            tokenize=False,
+            add_generation_prompt=True,
         )
-        out["labels"] = [ids[:] for ids in out["input_ids"]]
-        return out
+        full = tokenizer(full_text, truncation=True, max_length=MAX_LEN)
+        prompt_len = len(
+            tokenizer(prompt_text, truncation=True, max_length=MAX_LEN)["input_ids"]
+        )
+        prompt_len = min(prompt_len, len(full["input_ids"]))
+        labels = full["input_ids"][:]
+        labels[:prompt_len] = [-100] * prompt_len
+        return {
+            "input_ids": full["input_ids"],
+            "attention_mask": full["attention_mask"],
+            "labels": labels,
+        }
 
-    tokenized = ds.map(tokenize, batched=True, remove_columns=ds.column_names)
+    tokenized = Dataset.from_list(raw).map(
+        tokenize_row, remove_columns=["messages"]
+    )
 
     args = TrainingArguments(
         output_dir=str(OUT_DIR),
@@ -116,9 +127,14 @@ def main() -> None:
         remove_unused_columns=False,
         dataloader_pin_memory=False,
         use_cpu=True,
+        label_names=["labels"],
     )
 
-    collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        padding=True,
+        label_pad_token_id=-100,
+    )
 
     trainer = Trainer(
         model=model,
@@ -127,13 +143,17 @@ def main() -> None:
         data_collator=collator,
     )
 
-    print("开始训练（Intel Mac CPU，预计十几分钟到一小时，取决于机器）…")
+    print(
+        f"开始训练（{len(raw)} 条 × {EPOCHS} epoch，Intel CPU，"
+        "预计十几～几十分钟）…"
+    )
     trainer.train()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(OUT_DIR)
     tokenizer.save_pretrained(OUT_DIR)
     print(f"LoRA 已保存到: {OUT_DIR}")
+    print("建议用训练集里出现过的房源再测，例如默认望京 / 张江样例。")
 
 
 if __name__ == "__main__":

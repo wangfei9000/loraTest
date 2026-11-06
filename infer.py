@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 ROOT = Path(__file__).resolve().parent
 _LOCAL = ROOT / "models" / "Qwen2.5-0.5B-Instruct"
@@ -58,13 +58,16 @@ def main() -> None:
     )
     inputs = tokenizer(prompt, return_tensors="pt")
 
+    # 关掉 sampling 相关默认值，避免 temperature/top_p 告警
+    gen_cfg = GenerationConfig(
+        max_new_tokens=160,
+        do_sample=False,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
     with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=160,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+        out = model.generate(**inputs, generation_config=gen_cfg)
     gen = out[0][inputs["input_ids"].shape[1] :]
     print("\n—— 估价结果 ——")
     print(tokenizer.decode(gen, skip_special_tokens=True).strip())
